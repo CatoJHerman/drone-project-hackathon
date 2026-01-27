@@ -1,0 +1,155 @@
+import time
+import serial
+import threading
+import collections
+import matplotlib
+import cflib.crtp
+from cflib.crazyflie import Crazyflie
+from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
+
+# --- CONFIGURATION ---
+URI = 'udp://192.168.43.43'  # Your original Reference URI
+SERIAL_PORT = 'COM15'  # Your Arduino Port
+BAUD_RATE = 115200
+
+# Force stable graph backend
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+
+# Initialize Drivers (Global)
+cflib.crtp.init_drivers()
+
+# Global Flags
+drone_flying = False
+threshold = 125.0
+current_eeg = 0.0
+
+# Graph Data
+x_data = collections.deque(maxlen=100)
+y_data = collections.deque(maxlen=100)
+for i in range(100):
+    x_data.append(i)
+    y_data.append(0)
+
+
+# ==========================================
+#  YOUR EXACT REFERENCE FLIGHT CODE
+# ==========================================
+def run_reference_flight():
+    global drone_flying
+    print("\n[FLIGHT] Connecting to Drone...")
+
+    try:
+        # We connect FRESH every time, just like the working reference code
+        with SyncCrazyflie(URI, cf=Crazyflie(rw_cache='./cache')) as scf:
+            commander = scf.cf.commander
+
+            # Your Calibrated Settings
+            roll_trim = 5.9
+            pitch_trim = -2.0
+            base_thrust = 40000
+
+            print("[FLIGHT] Connected! Starting 10s Demo...")
+
+            # 1. Arming
+            print("[FLIGHT] Arming...")
+            for _ in range(10):
+                commander.send_setpoint(0, 0, 0, 0)
+                time.sleep(0.02)
+
+            # 2. Takeoff
+            print("[FLIGHT] Taking Off...")
+            for _ in range(50):
+                commander.send_setpoint(roll_trim, pitch_trim, 0, base_thrust)
+                time.sleep(0.02)
+
+            # 3. 10-Second Hover
+            print("[FLIGHT] Hovering...")
+            for i in range(500):
+                current_thrust = base_thrust + (i * 2)
+                commander.send_setpoint(roll_trim, pitch_trim, 0, int(current_thrust))
+                time.sleep(0.02)
+
+            # 4. Landing
+            print("[FLIGHT] Landing...")
+            landing_start = base_thrust + 1000
+            for t in range(landing_start, 20000, -500):
+                commander.send_setpoint(roll_trim, pitch_trim, 0, t)
+                time.sleep(0.02)
+
+            commander.send_setpoint(0, 0, 0, 0)
+            print("[FLIGHT] Done. Disconnecting.")
+
+    except Exception as e:
+        print(f"[FLIGHT ERROR] {e}")
+
+    # Unlock the system so we can fly again
+    drone_flying = False
+
+
+# ==========================================
+#  SERIAL & GRAPH LOGIC
+# ==========================================
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+    time.sleep(2)
+except Exception as e:
+    print(f"Error connecting to Arduino: {e}")
+    exit()
+
+fig, ax = plt.subplots()
+line, = ax.plot(x_data, y_data, lw=2, color='blue', label='BrainWave')
+thresh_line = ax.axhline(y=threshold, color='green', linestyle='--', label='Trigger')
+ax.set_ylim(0, 600)
+ax.set_title("Blink to Launch Drone")
+ax.legend(loc='upper left')
+
+
+def update_graph(frame):
+    global current_eeg, threshold, drone_flying
+
+    try:
+        # 1. Read Arduino
+        if ser.in_waiting > 0:
+            raw = ser.readline().decode('utf-8', errors='ignore').strip()
+            parts = raw.split(',')
+            for p in parts:
+                if "BrainWave" in p:
+                    current_eeg = float(p.split(':')[1])
+                if "BlinkThreshold" in p:
+                    threshold = float(p.split(':')[1])
+
+        # 2. Update Graph
+        y_data.append(current_eeg)
+        line.set_ydata(y_data)
+        thresh_line.set_ydata([threshold, threshold])
+
+        # 3. CHECK TRIGGER
+        # If signal is high AND drone is not already flying...
+        if current_eeg > threshold and not drone_flying:
+            print(">>> SPIKE DETECTED! LAUNCHING THREAD... <<<")
+            drone_flying = True  # Lock it so we don't launch twice
+
+            # Start the flight in a background thread
+            t = threading.Thread(target=run_reference_flight)
+            t.start()
+
+        # Visual Feedback
+        if drone_flying:
+            line.set_color('red')
+            ax.set_title("DRONE IS FLYING...")
+        else:
+            line.set_color('blue')
+            ax.set_title("Waiting for Blink...")
+
+    except Exception:
+        pass
+
+    return line, thresh_line
+
+
+if __name__ == '__main__':
+    print("System Ready. Blink to Fly.")
+    ani = animation.FuncAnimation(fig, update_graph, interval=50, blit=False, cache_frame_data=False)
+    plt.show()
