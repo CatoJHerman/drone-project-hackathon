@@ -1,0 +1,97 @@
+// EEG Drone Tuning (Eye Blink → Thrust)
+// Works on: Arduino Uno R4 & ESP32
+
+const int SENSOR_PIN = A0;     // ESP32: use 36
+const int THRUST_PIN = 9;      // PWM output to ESC / motor controller
+
+// --- EEG SETTINGS ---
+int threshold = 10;            // Blink detect threshold
+int maxSignal = 100;           // Hard blink ceiling
+
+// --- FILTER SETTINGS ---
+float alphaEnvelope = 0.45;    // Envelope smoothing
+float hpAlpha = 0.995;         // High-pass filter (DC removal)
+float notchAlpha = 0.95;       // EMF suppression (50/60Hz)
+
+// --- VARIABLES ---
+long baseline = 0;
+float envelope = 0;
+float hpPrev = 0;
+float rawPrev = 0;
+float notchPrev = 0;
+
+// --- THRUST SETTINGS ---
+int thrustMin = 0;             // Motor OFF
+int thrustMax = 180;           // Limit for safety (ESC usually 255 max)
+
+void setup() {
+  Serial.begin(115200);
+
+  #ifdef ARDUINO_UNO_R4_MINIMA
+    analogReadResolution(10);
+  #endif
+
+  pinMode(THRUST_PIN, OUTPUT);
+
+  // --- CALIBRATION ---
+  Serial.println("Calibrating EEG... Stay still.");
+  long total = 0;
+  for (int i = 0; i < 200; i++) {
+    total += analogRead(SENSOR_PIN);
+    delay(10);
+  }
+  baseline = total / 200;
+
+  Serial.print("Baseline: ");
+  Serial.println(baseline);
+  delay(1000);
+}
+
+void loop() {
+  int rawValue = analogRead(SENSOR_PIN);
+
+  // --- 1. CENTER SIGNAL ---
+  float centered = rawValue - baseline;
+
+  // --- 2. HIGH-PASS FILTER (Remove DC drift) ---
+  float highPassed = hpAlpha * (hpPrev + centered - rawPrev);
+  hpPrev = highPassed;
+  rawPrev = centered;
+
+  // --- 3. NOTCH FILTER (Kill EMF noise) ---
+  float notched = (notchAlpha * notchPrev) + (1 - notchAlpha) * highPassed;
+  notchPrev = notched;
+
+  // --- 4. RECTIFY ---
+  float rectified = abs(notched);
+
+  // --- 5. ENVELOPE FOLLOWER ---
+  envelope = (alphaEnvelope * rectified) +
+             ((1 - alphaEnvelope) * envelope);
+
+  // --- 6. THRUST LOGIC ---
+  int thrust = 0;
+
+  if (envelope > threshold) {
+    thrust = map(envelope, threshold, maxSignal, thrustMin, thrustMax);
+    thrust = constrain(thrust, thrustMin, thrustMax);
+  }
+
+  analogWrite(THRUST_PIN, thrust);
+
+  // --- 7. SERIAL PLOTTER ---
+  Serial.print("Min:0,");
+  Serial.print("MaxLimit:");
+  Serial.print(maxSignal);
+  Serial.print(",");
+  Serial.print("BlinkThreshold:");
+  Serial.print(threshold);
+  Serial.print(",");
+  Serial.print("BrainWave:");
+  Serial.print(envelope);
+  Serial.print(",");
+  Serial.print("Thrust:");
+  Serial.println(thrust);
+
+  delay(10);
+}
