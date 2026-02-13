@@ -3,17 +3,19 @@ import serial
 import threading
 import collections
 import matplotlib
+import csv
+import datetime
 import cflib.crtp
 from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
 from cflib.crazyflie.log import LogConfig
 
 # --- CONFIGURATION ---
-URI = 'udp://192.168.43.43'  # Check your .42 / .43 address
+URI = 'udp://192.168.43.43'
 SERIAL_PORT = 'COM15'
 BAUD_RATE = 115200
 
-# Force stable graph backend
+# Force stable graph backend\
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
@@ -23,8 +25,8 @@ cflib.crtp.init_drivers()
 
 # Global Flags
 drone_flying = False
-threshold = 125.0
-current_eeg = 0.0
+THRESHOLD = 50.0
+current_envelope = 0.0
 
 # Graph Data
 x_data = collections.deque(maxlen=100)
@@ -44,118 +46,151 @@ flight_state = {
 
 
 # ==========================================
-#  1. FUZZY LOGIC ENGINE
+#  1. SIGNAL PROCESSING
+# ==========================================
+class BioSignalProcessor:
+    def __init__(self):
+        self.hp_prev = 0
+        self.raw_prev = 0
+        self.notch_prev = 0
+        self.envelope = 0
+        self.hp_alpha = 0.995
+        self.notch_alpha = 0.95
+        self.alpha_env = 0.45
+
+    def process(self, raw_val):
+        hp = self.hp_alpha * (self.hp_prev + raw_val - self.raw_prev)
+        self.hp_prev = hp
+        self.raw_prev = raw_val
+        notch = (self.notch_alpha * self.notch_prev) + (1 - self.notch_alpha) * hp
+        self.notch_prev = notch
+        rectified = abs(notch)
+        self.envelope = (self.alpha_env * rectified) + ((1 - self.alpha_env) * self.envelope)
+        return self.envelope
+        #return raw_val
+
+
+processor = BioSignalProcessor()
+
+
+# ==========================================
+#  2. FUZZY LOGIC ENGINE (SAFE MODE)
 # ==========================================
 def calculate_fuzzy_correction(gyro_val, sensitivity):
     error = -gyro_val
     abs_error = abs(error)
 
-    # Deadband (Ignore tiny vibrations)
-    if abs_error < 10.0:
+    # 1. Deadband
+    if abs_error < 0.05:
         return 0.0
-    # Gentle Correction
-    elif abs_error < 100.0:
-        return error * (sensitivity * 0.02)
-    # Strong Correction
+
+    # 2. Calculate Raw Correction (SAFE SETTINGS)
+    # Gentle: 0.2 (This is the stable value)
+    # Strong: 0.5 (This prevents over-correction)
+    if abs_error < 100.0:
+        raw_corr = error * (sensitivity * 0.2)
     else:
-        return error * (sensitivity * 0.08)
+        raw_corr = error * (sensitivity * 0.5)
+
+    # 3. SAFETY CLAMP
+    if raw_corr > 15.0:
+        return 15.0
+    elif raw_corr < -15.0:
+        return -15.0
+    else:
+        return raw_corr
 
 
 def stabilizer_callback(timestamp, data, logconf):
     with state_lock:
-        flight_state["gyro_x"] = data['gyro.x']  # Roll speed
-        flight_state["gyro_y"] = data['gyro.y']  # Pitch speed
-        flight_state["gyro_z"] = data['gyro.z']  # Yaw speed
+        flight_state["gyro_x"] = data['gyro.x']
+        flight_state["gyro_y"] = data['gyro.y']
+        flight_state["gyro_z"] = data['gyro.z']
         flight_state["calibrated"] = True
 
 
 # ==========================================
-#  2. FULLY STABILIZED FLIGHT
+#  3. FLIGHT LOGIC
 # ==========================================
 def run_reference_flight():
     global drone_flying
     print("\n[FLIGHT] Connecting to Drone...")
+
+    # Store flight data in memory
+    flight_logs = []
 
     try:
         with SyncCrazyflie(URI, cf=Crazyflie(rw_cache='./cache')) as scf:
             cf = scf.cf
             commander = cf.commander
 
-            # A. ENABLE ALL SENSORS
             log_conf = LogConfig(name='Stability', period_in_ms=20)
             log_conf.add_variable('gyro.x', 'float')
-            log_conf.add_variable('gyro.y', 'float')  # Pitch
+            log_conf.add_variable('gyro.y', 'float')
             log_conf.add_variable('gyro.z', 'float')
             cf.log.add_config(log_conf)
             log_conf.data_received_cb.add_callback(stabilizer_callback)
             log_conf.start()
-
             time.sleep(1)
 
-            # YOUR TRIMS (Base values)
-            roll_trim = 5.9
-            pitch_trim = -2.0
-            base_thrust = 40000
+            # --- TRIMS (From your rope test) ---
+            # Roll: 6.3 (Reduced from 6.6 to stop Right drift)
+            roll_trim = 6.3
+            # Pitch: -3.8 (Increased from -4.5 to stop Forward drift)
+            pitch_trim = -3.8
 
-            print("[FLIGHT] Connected! Starting 3-Axis Stabilization...")
+            # --- THRUST ---
+            HOVER_THRUST = 36500
 
-            # 1. Arming
-            for _ in range(10):
-                commander.send_setpoint(0, 0, 0, 0)
-                time.sleep(0.02)
+            print("[FLIGHT] Connected! Taking Off...")
+            for _ in range(10): commander.send_setpoint(0, 0, 0, 0); time.sleep(0.02)
+            for _ in range(50): commander.send_setpoint(roll_trim, pitch_trim, 0, HOVER_THRUST); time.sleep(0.02)
 
-            # 2. Takeoff (Standard)
-            print("[FLIGHT] Taking Off...")
-            for _ in range(50):
-                commander.send_setpoint(roll_trim, pitch_trim, 0, base_thrust)
-                time.sleep(0.02)
+            print("[FLIGHT] Logging Data...")
 
-            # 3. 3-AXIS STABILIZED HOVER
-            print("[FLIGHT] Stabilized Hovering...")
-
-            # Gains (Sensitivity)
-            roll_gain = 0.5
-            pitch_gain = 0.5  # New: Stabilize Forward/Back!
+            # --- GAINS (SAFE) ---
+            # 0.8 is the confirmed stable gain.
+            roll_gain = 0.8
+            pitch_gain = 0.8
             yaw_gain = 1.0
 
-            for i in range(500):  # 10 seconds
-                current_thrust = base_thrust + (i * 2)
-
-                # Read Sensors
+            for i in range(150):  # 3 seconds
+                current_thrust = HOVER_THRUST
                 with state_lock:
                     gx = flight_state["gyro_x"]
-                    gy = flight_state["gyro_y"]  # Pitch Data
+                    gy = flight_state["gyro_y"]
                     gz = flight_state["gyro_z"]
 
-                # Calculate Corrections
                 fuzzy_roll = calculate_fuzzy_correction(gx, roll_gain)
-                fuzzy_pitch = calculate_fuzzy_correction(gy, pitch_gain)  # Fix Forward Drift
+                fuzzy_pitch = calculate_fuzzy_correction(gy, pitch_gain)
                 fuzzy_yaw = calculate_fuzzy_correction(gz, yaw_gain)
 
-                # Combine: Trim + Correction
+                # LOGGING
+                flight_logs.append([i, gx, gy, fuzzy_roll, fuzzy_pitch])
+
                 final_roll = roll_trim + fuzzy_roll
-                final_pitch = pitch_trim + fuzzy_pitch  # Now Active!
+                final_pitch = pitch_trim + fuzzy_pitch
                 final_yaw = fuzzy_yaw
 
-                # Send Command
                 commander.send_setpoint(final_roll, final_pitch, final_yaw, int(current_thrust))
-
-                # Debug Print (Optional: See it working)
-                if i % 10 == 0:
-                    print(f"Correction -> R:{fuzzy_roll:.2f} P:{fuzzy_pitch:.2f}")
-
                 time.sleep(0.02)
 
-            # 4. Landing
             print("[FLIGHT] Landing...")
-            landing_start = base_thrust + 1000
-            for t in range(landing_start, 20000, -500):
+            for t in range(HOVER_THRUST, 20000, -500):
                 commander.send_setpoint(roll_trim, pitch_trim, 0, t)
                 time.sleep(0.02)
 
             commander.send_setpoint(0, 0, 0, 0)
             log_conf.stop()
             print("[FLIGHT] Done.")
+
+            # --- SAVE TO CSV ---
+            filename = f"flight_log_{datetime.datetime.now().strftime('%H%M%S')}.csv"
+            with open(filename, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(["Loop", "Gyro_X", "Gyro_Y", "Correction_Roll", "Correction_Pitch"])
+                writer.writerows(flight_logs)
+            print(f"[DATA] Saved optimization logs to {filename}")
 
     except Exception as e:
         print(f"[FLIGHT ERROR] {e}")
@@ -164,41 +199,41 @@ def run_reference_flight():
 
 
 # ==========================================
-#  3. SERIAL & GRAPH (Unchanged)
+#  4. MAIN LOOP
 # ==========================================
 try:
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
     time.sleep(2)
+    ser.reset_input_buffer()
 except Exception as e:
     print(f"Error connecting to Arduino: {e}")
     exit()
 
 fig, ax = plt.subplots()
 line, = ax.plot(x_data, y_data, lw=2, color='blue', label='BrainWave')
-thresh_line = ax.axhline(y=threshold, color='green', linestyle='--', label='Trigger')
-ax.set_ylim(0, 600)
-ax.set_title("Blink to Launch Drone")
+thresh_line = ax.axhline(y=THRESHOLD, color='green', linestyle='--', label='Trigger')
+ax.set_ylim(0, 200)
+ax.set_title("Think to Launch Drone")
 ax.legend(loc='upper left')
 
 
 def update_graph(frame):
-    global current_eeg, threshold, drone_flying
+    global current_envelope, drone_flying
     try:
-        if ser.in_waiting > 0:
-            raw = ser.readline().decode('utf-8', errors='ignore').strip()
-            parts = raw.split(',')
-            for p in parts:
-                if "BrainWave" in p:
-                    current_eeg = float(p.split(':')[1])
-                if "BlinkThreshold" in p:
-                    threshold = float(p.split(':')[1])
+        while ser.in_waiting > 0:
+            try:
+                raw_str = ser.readline().decode('utf-8').strip()
+                if not raw_str: continue
+                raw_val = int(raw_str)
+                current_envelope = processor.process(raw_val)
+            except ValueError:
+                pass
 
-        y_data.append(current_eeg)
+        y_data.append(current_envelope)
         line.set_ydata(y_data)
-        thresh_line.set_ydata([threshold, threshold])
 
-        if current_eeg > threshold and not drone_flying:
-            print(">>> SPIKE DETECTED! LAUNCHING STABILIZED THREAD... <<<")
+        if current_envelope > THRESHOLD and not drone_flying:
+            print(f">>> TRIGGER! ({current_envelope:.1f}) <<<")
             drone_flying = True
             t = threading.Thread(target=run_reference_flight)
             t.start()
@@ -208,13 +243,13 @@ def update_graph(frame):
             ax.set_title("DRONE IS FLYING...")
         else:
             line.set_color('blue')
-            ax.set_title("Waiting for Blink...")
+            ax.set_title(f"Waiting... (Val: {current_envelope:.1f})")
     except Exception:
         pass
     return line, thresh_line
 
 
 if __name__ == '__main__':
-    print("System Ready. Blink to Fly.")
-    ani = animation.FuncAnimation(fig, update_graph, interval=50, blit=False, cache_frame_data=False)
+    print("System Ready to Fly.")
+    ani = animation.FuncAnimation(fig, update_graph, interval=20, blit=False, cache_frame_data=False)
     plt.show()
